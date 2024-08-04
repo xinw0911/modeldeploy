@@ -1,5 +1,3 @@
-# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
-# SPDX-License-Identifier: MIT-0
 import argparse
 import json
 import logging
@@ -11,6 +9,7 @@ from botocore.exceptions import ClientError
 logger = logging.getLogger(__name__)
 sm_client = boto3.client("sagemaker")
 
+
 def get_approved_package(model_package_group_name):
     """Gets the latest approved model package for a model package group.
 
@@ -21,28 +20,40 @@ def get_approved_package(model_package_group_name):
         The SageMaker Model Package ARN.
     """
     try:
-        approved_packages = []
-        # Find the latest approved model package. 
-        # If there are ceveral approved model packages, take the most recent one (by CreationTime)
-        for p in sm_client.get_paginator('list_model_packages').paginate(
+        # Get the latest approved model package for autopilot
+        response = sm_client.list_model_packages(
             ModelPackageGroupName=model_package_group_name,
-            ModelApprovalStatus='Approved',
+            ModelApprovalStatus="Approved",
             SortBy="CreationTime",
-            SortOrder="Descending",
-            ):
-            approved_packages.extend(p["ModelPackageSummaryList"])
+            MaxResults=100,
+        )
+        approved_packages = response["ModelPackageSummaryList"]
+
+        # Fetch more packages if none returned with continuation token
+        while len(approved_packages) == 0 and "NextToken" in response:
+            logger.debug(
+                "Getting more packages for token: {}".format(response["NextToken"])
+            )
+            response = sm_client.list_model_packages(
+                ModelPackageGroupName=model_package_group_name,
+                ModelApprovalStatus="Approved",
+                SortBy="CreationTime",
+                MaxResults=100,
+                NextToken=response["NextToken"],
+            )
+            approved_packages.extend(response["ModelPackageSummaryList"])
 
         # Return error if no packages found
         if len(approved_packages) == 0:
-            error_message = (
-                f"No approved ModelPackage found for ModelPackageGroup: {model_package_group_name}"
-            )
+            error_message = f"No approved ModelPackage found for ModelPackageGroup: {model_package_group_name}"
             logger.error(error_message)
             raise Exception(error_message)
 
         # Return the pmodel package arn
         model_package_arn = approved_packages[0]["ModelPackageArn"]
-        logger.info(f"Identified the latest approved model package: {model_package_arn}")
+        logger.info(
+            f"Identified the latest approved model package: {model_package_arn}"
+        )
         return model_package_arn
     except ClientError as e:
         error_message = e.response["Error"]["Message"]
@@ -50,50 +61,102 @@ def get_approved_package(model_package_group_name):
         raise Exception(error_message)
 
 
-def prepare_config(args, model_package_arn, config_name, params):
+def extend_config(args, model_package_arn, stage_config):
     """
     Extend the stage configuration with additional parameters and tags based.
     """
-    # Read the config template
-    with open(f"{config_name}-template.json", "r") as f:
-        config = json.load(f)
+    # Verify that config has parameters and tags sections
+    if (
+        not "Parameters" in stage_config
+        or not "StageName" in stage_config["Parameters"]
+    ):
+        raise Exception("Configuration file must include SageName parameter")
+    if not "Tags" in stage_config:
+        stage_config["Tags"] = {}
+    # Create new params and tags
+    new_params = {
+        "SageMakerProjectName": args.sagemaker_project_name,
+        "ModelPackageName": model_package_arn,
+        "ModelExecutionRoleArn": args.model_execution_role,
+    }
+    new_tags = {
+        "sagemaker:deployment-stage": stage_config["Parameters"]["StageName"],
+        "sagemaker:project-id": args.sagemaker_project_id,
+        "sagemaker:project-name": args.sagemaker_project_name,
+    }
+    # Add tags from Project
+    get_pipeline_custom_tags(args, sm_client, new_tags)
 
-    # Optional: Add validation of config parameters if needed
+    return {
+        "Parameters": {**stage_config["Parameters"], **new_params},
+        "Tags": {**stage_config.get("Tags", {}), **new_tags},
+    }
 
-    # Add deployment-time parameters
-    config.append({ "ParameterKey": "Accounts", "ParameterValue": params["Accounts"] })
-    config.append({ "ParameterKey": "ExecutionRoleName", "ParameterValue": params["ExecutionRoleName"] })
-    config.append({ "ParameterKey": "SageMakerProjectName", "ParameterValue": args.sagemaker_project_name, })
-    config.append({ "ParameterKey": "SageMakerProjectId", "ParameterValue": args.sagemaker_project_id })
-    config.append({ "ParameterKey": "ModelPackageName", "ParameterValue": model_package_arn })
-    config.append({ "ParameterKey": "EnvName", "ParameterValue": args.env_name })
-    config.append({ "ParameterKey": "EnvType", "ParameterValue": params["EnvType"] })
-    config.append({ "ParameterKey": "VolumeKmsKeyArn", "ParameterValue": args.ebs_kms_key_arn })
-    config.append({ "ParameterKey": "SageMakerSecurityGroupIds", "ParameterValue":  f"{args.env_name}-{params['EnvType']}-sagemaker-sg-ids" })
-    config.append({ "ParameterKey": "SageMakerSubnetIds", "ParameterValue": f"{args.env_name}-{params['EnvType']}-private-subnet-ids" })
 
-    logger.info(f"Saving CodePipeline CFN template configuration file ({config_name}.json): {json.dumps(config, indent=2)}")
-    with open(f"{config_name}.json", "w") as f:
-        json.dump(config, f, indent=2)
+def get_pipeline_custom_tags(args, sm_client, new_tags):
+    try:
+        response = sm_client.list_tags(ResourceArn=args.sagemaker_project_arn.lower())
+        project_tags = response["Tags"]
+        for project_tag in project_tags:
+            new_tags[project_tag["Key"]] = project_tag["Value"]
+    except:
+        logger.error("Error getting project tags")
+    return new_tags
+
+
+def get_cfn_style_config(stage_config):
+    parameters = []
+    for key, value in stage_config["Parameters"].items():
+        parameter = {"ParameterKey": key, "ParameterValue": value}
+        parameters.append(parameter)
+    tags = []
+    for key, value in stage_config["Tags"].items():
+        tag = {"Key": key, "Value": value}
+        tags.append(tag)
+    return parameters, tags
+
+
+def create_cfn_params_tags_file(config, export_params_file, export_tags_file):
+    # Write Params and tags in separate file for Cfn cli command
+    parameters, tags = get_cfn_style_config(config)
+    with open(export_params_file, "w") as f:
+        json.dump(parameters, f, indent=4)
+    with open(export_tags_file, "w") as f:
+        json.dump(tags, f, indent=4)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--log-level", type=str, default=os.environ.get("LOGLEVEL", "INFO").upper())
+    parser.add_argument(
+        "--log-level", type=str, default=os.environ.get("LOGLEVEL", "INFO").upper()
+    )
+    parser.add_argument("--model-execution-role", type=str, required=True)
+    parser.add_argument("--model-package-group-name", type=str, required=True)
     parser.add_argument("--sagemaker-project-id", type=str, required=True)
     parser.add_argument("--sagemaker-project-name", type=str, required=True)
-    parser.add_argument("--model-package-group-name", type=str, required=True)
-    parser.add_argument("--staging-config-name", type=str, default="staging-config")
-    parser.add_argument("--prod-config-name", type=str, default="prod-config")
-    parser.add_argument("--sagemaker-execution-role-staging-name", type=str, required=True)
-    parser.add_argument("--sagemaker-execution-role-prod-name", type=str, required=True)
-    parser.add_argument("--staging-accounts", type=str, default='')
-    parser.add_argument("--prod-accounts", type=str, default='')
-    parser.add_argument("--env-name", type=str, required=True)
-    parser.add_argument("--ebs-kms-key-arn", type=str, required=True)
-    parser.add_argument("--env-type-staging-name", type=str, required=True)
-    parser.add_argument("--env-type-prod-name", type=str, required=True)
-    parser.add_argument("--multi-account-deployment", type=str, required=True)
-
+    parser.add_argument("--sagemaker-project-arn", type=str, required=False)
+    parser.add_argument("--s3-bucket", type=str, required=True)
+    parser.add_argument(
+        "--import-staging-config", type=str, default="staging-config.json"
+    )
+    parser.add_argument("--import-prod-config", type=str, default="prod-config.json")
+    parser.add_argument(
+        "--export-staging-config", type=str, default="staging-config-export.json"
+    )
+    parser.add_argument(
+        "--export-staging-params", type=str, default="staging-params-export.json"
+    )
+    parser.add_argument(
+        "--export-staging-tags", type=str, default="staging-tags-export.json"
+    )
+    parser.add_argument(
+        "--export-prod-config", type=str, default="prod-config-export.json"
+    )
+    parser.add_argument(
+        "--export-prod-params", type=str, default="prod-params-export.json"
+    )
+    parser.add_argument("--export-prod-tags", type=str, default="prod-tags-export.json")
+    parser.add_argument("--export-cfn-params-tags", type=bool, default=False)
     args, _ = parser.parse_known_args()
 
     # Configure logging to output the line number and message
@@ -103,23 +166,24 @@ if __name__ == "__main__":
     # Get the latest approved package
     model_package_arn = get_approved_package(args.model_package_group_name)
 
-    staging_accounts, prod_accounts = "", ""
-    if args.multi_account_deployment == "YES":
-        staging_accounts, prod_accounts = args.staging_accounts, args.prod_accounts
-    else:
-        staging_accounts = prod_accounts = boto3.client('sts').get_caller_identity()["Account"]
+    # Write the staging config
+    with open(args.import_staging_config, "r") as f:
+        staging_config = extend_config(args, model_package_arn, json.load(f))
+    logger.debug("Staging config: {}".format(json.dumps(staging_config, indent=4)))
+    with open(args.export_staging_config, "w") as f:
+        json.dump(staging_config, f, indent=4)
+    if args.export_cfn_params_tags:
+        create_cfn_params_tags_file(
+            staging_config, args.export_staging_params, args.export_staging_tags
+        )
 
-    # Write the staging and prod template configuration files for CodePipeline
-    for k, v in {
-                args.staging_config_name:{
-                    "ExecutionRoleName":args.sagemaker_execution_role_staging_name, 
-                    "Accounts":staging_accounts,
-                    "EnvType":args.env_type_staging_name
-                    }, 
-                 args.prod_config_name:{
-                    "ExecutionRoleName":args.sagemaker_execution_role_prod_name, 
-                    "Accounts":prod_accounts,
-                    "EnvType":args.env_type_prod_name
-                    }
-                 }.items():
-        prepare_config(args, model_package_arn, k, v)
+    # Write the prod config for code pipeline
+    with open(args.import_prod_config, "r") as f:
+        prod_config = extend_config(args, model_package_arn, json.load(f))
+    logger.debug("Prod config: {}".format(json.dumps(prod_config, indent=4)))
+    with open(args.export_prod_config, "w") as f:
+        json.dump(prod_config, f, indent=4)
+    if args.export_cfn_params_tags:
+        create_cfn_params_tags_file(
+            prod_config, args.export_prod_params, args.export_prod_tags
+        )
